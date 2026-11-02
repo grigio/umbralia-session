@@ -96,4 +96,5 @@ package() {
 
   install -Dm644 "$startdir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 "$startdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$startdir/umbralia.png" "$pkgdir/usr/share/doc/$pkgname/umbralia.png"
 }

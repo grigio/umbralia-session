@@ -6,7 +6,7 @@ compositor is [umbriel](https://umbriel.github.io/), the shell is
 [Noctalia](https://github.com/noctalia-dev/noctalia), and the session starts
 everything through systemd user units instead of a umbriel autostart file.
 
-![Umbralia: umbriel + Noctalia](umbralia-session.png)
+![Umbralia: umbriel + Noctalia](umbralia.png)
 
 The package installs:
 
