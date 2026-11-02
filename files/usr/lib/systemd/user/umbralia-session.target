@@ -1,0 +1,9 @@
+[Unit]
+Description=Umbralia session (umbriel + Noctalia)
+Documentation=man:umbriel(1) man:systemd.special(7) https://github.com/grigio/umbralia-session
+# The generic session target is what portals and other graphical-session
+# services attach to. Starting this target pulls it in (BindsTo implies
+# Requires) and stopping it tears the session down.
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target umbralia-noctalia.service
+After=graphical-session-pre.target

@@ -1,0 +1,48 @@
+# The package installs the session and its systemd user units. It deliberately
+# does not edit /etc/greetd: installing a package should not change which
+# session the greeter starts. Making Umbralia the default is an explicit step.
+post_install() {
+  cat <<'EOF'
+Umbralia is installed. It was NOT set as the default session: this package
+does not edit /etc/greetd.
+
+Greeters that read /usr/share/wayland-sessions (Noctalia Greeter, GDM, SDDM)
+already list it. gtkgreet only lists /etc/greetd/environments plus its -c
+argument. To make Umbralia selectable without changing the default:
+
+  sudo umbralia-session-default --list
+
+To make it the default, run:
+  sudo umbralia-session-default
+
+If you already use umbriel, this package does not touch ~/.config/umbriel. Remove
+these duplicates so the session's systemd units are the only owners:
+
+  - ~/.config/umbriel/environment: remove XDG_CURRENT_DESKTOP, or set it to
+    umbralia:wlroots (the launcher exports it).
+  - ~/.config/umbriel/autostart: remove noctalia and portal startup lines.
+    They are started by umbralia-session.target. If you keep them, guard just
+    those lines with UMBRALIA_SESSION.
+  - Old personal units (not namespaced): disable noctalia-umbriel-sync.path and
+    umbriel-4finger-gestures.service.
+EOF
+}
+
+post_upgrade() {
+  cat <<'EOF'
+Umbralia was upgraded. The package still does not edit /etc/greetd or
+~/.config/umbriel.
+EOF
+}
+
+pre_remove() {
+  cat <<'EOF'
+Removing this package does not change /etc/greetd. If Umbralia is the greeter
+default, point the greeter at another session first, otherwise it will try to
+start a command that no longer exists.
+
+  sudo cp -a /etc/greetd/config.toml.bak.<timestamp> /etc/greetd/config.toml
+
+(or edit the -c argument / environments list by hand).
+EOF
+}

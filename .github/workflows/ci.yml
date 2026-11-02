@@ -1,0 +1,126 @@
+name: CI
+
+# Cheap sanity checks on every push / pull request: the shell scripts pass
+# shellcheck, the Python helpers compile, the XML parses and the PKGBUILD
+# still builds. Releases are built by arch-package.yml on v* tags.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: shellcheck and syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck -s sh \
+            files/usr/bin/umbralia-session \
+            files/usr/bin/umbralia-screenshot \
+            files/usr/bin/umbralia-theme-reload
+          shellcheck -s bash scripts/*.sh umbralia-session.install
+
+      - name: Python syntax
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            files/usr/bin/umbralia-theme-sync \
+            files/usr/bin/umbralia-4finger-gestures
+
+      - name: XML syntax
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          for path in ("files/etc/xdg/umbriel/rc.xml", "files/etc/xdg/umbriel/menu.xml"):
+              ET.parse(path)
+              print(f"{path}: ok")
+          PY
+
+  package:
+    name: makepkg
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+      options: --privileged
+    steps:
+      - name: Bootstrap git
+        run: pacman -Syu --noconfirm --needed --disable-download-timeout git
+
+      - uses: actions/checkout@v6
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          useradd -m builder 2>/dev/null || true
+          mkdir -p /tmp/pkgout
+          chown -R builder:builder "$GITHUB_WORKSPACE" /tmp/pkgout
+          # umbriel, noctalia and the portals are not in the clean container;
+          # --nodeps keeps the build focused on the packaging.
+          su builder -s /bin/bash -c "
+            cd '$GITHUB_WORKSPACE'
+            PKGDEST=/tmp/pkgout makepkg --nodeps --noconfirm --force
+          "
+          ls -l /tmp/pkgout
+          # the launcher and helpers must be executable inside the package
+          bsdtar -tvf /tmp/pkgout/*.pkg.tar.zst | tee /tmp/pkglist.txt
+          for path in \
+            usr/bin/umbralia-session \
+            usr/bin/umbralia-session-default \
+            usr/bin/umbralia-theme-sync \
+            usr/bin/umbralia-theme-reload \
+            usr/bin/umbralia-4finger-gestures \
+            usr/bin/umbralia-screenshot; do
+            grep -qE "^-rwxr-xr-x .*${path}\$" /tmp/pkglist.txt
+          done
+          for path in \
+            usr/share/wayland-sessions/umbralia.desktop \
+            usr/lib/systemd/user/umbralia-session.target \
+            usr/lib/systemd/user/umbralia-noctalia.service \
+            usr/lib/systemd/user/umbralia-theme-sync.path \
+            usr/lib/systemd/user/umbralia-theme-sync.service \
+            usr/lib/systemd/user/umbralia-gestures.service \
+            usr/share/xdg-desktop-portal/umbralia-portals.conf \
+            etc/xdg/umbriel/rc.xml \
+            etc/xdg/umbriel/menu.xml \
+            usr/share/themes/macos-dark/umbriel/themerc \
+            usr/share/doc/umbralia-session/README.md \
+            usr/share/licenses/umbralia-session/LICENSE \
+            usr/share/licenses/umbralia-session/LICENSE.macos-dark-theme; do
+            grep -qE "^-rw-r--r-- .*${path}\$" /tmp/pkglist.txt
+          done
+
+      - name: Install/remove smoke test
+        run: |
+          set -euo pipefail
+          # --nodeps: umbriel/noctalia/portals are not in this container.
+          pacman -U --noconfirm --nodeps /tmp/pkgout/*.pkg.tar.zst
+          test -x /usr/bin/umbralia-session
+          test -x /usr/bin/umbralia-session-default
+          test -x /usr/bin/umbralia-theme-sync
+          test -x /usr/bin/umbralia-4finger-gestures
+          test -x /usr/bin/umbralia-screenshot
+          test -f /usr/lib/systemd/user/umbralia-noctalia.service
+          # The post_install script must not need /etc/greetd (and must not
+          # edit it). Verify the units resolve, then remove the package.
+          install -d -m 700 /tmp/run
+          # --man=no: umbriel is not installed here (--nodeps), so verify would
+          # otherwise fail on the man:umbriel(1) entry in Documentation=.
+          XDG_RUNTIME_DIR=/tmp/run systemd-analyze --user verify --man=no \
+            /usr/lib/systemd/user/umbralia-session.target \
+            /usr/lib/systemd/user/umbralia-noctalia.service \
+            /usr/lib/systemd/user/umbralia-theme-sync.path \
+            /usr/lib/systemd/user/umbralia-theme-sync.service \
+            /usr/lib/systemd/user/umbralia-gestures.service
+          pacman -R --noconfirm umbralia-session

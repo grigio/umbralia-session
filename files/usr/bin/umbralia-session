@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# Umbralia — a minimal umbriel + Noctalia Wayland session.
+# Source: https://github.com/grigio/umbralia-session
+# (installed by the umbralia-session package; edit the source, not the copy
+# in /usr/bin)
+#
+# The compositor is umbriel; the shell is Noctalia. This launcher owns the
+# session startup. It deliberately does NOT install or use
+# ~/.config/umbriel/autostart: Noctalia and the portals are systemd user units
+# started through umbralia-session.target.
+#
+# XDG session entry: /usr/share/wayland-sessions/umbralia.desktop
+# systemd user target: /usr/lib/systemd/user/umbralia-session.target
+#
+# What runs, and nothing else:
+#   umbriel                           compositor, started here (it must run
+#                                   before the socket and the session target)
+#   umbralia-noctalia.service      bar, dock, launcher, notifications, lock
+#                                   screen, idle/suspend, polkit agent, MPRIS,
+#                                   screensaver; supervised by systemd
+#   xdg-desktop-portal + umbriel     restarted below, after the socket exists
+# Already covered without starting anything here:
+#   dbus-broker                     user bus
+#   pipewire / wireplumber          socket + enabled unit (audio, screencast)
+#   gnome-keyring-daemon            secret service, socket activated
+#   gvfs-*, xdg-document-portal     D-Bus activated on first use, if installed
+#   upower, power-profiles-daemon   system services, session agnostic
+
+set -euo pipefail
+
+# Version (updated by release workflow)
+VERSION="1.0.0"
+
+usage() {
+    cat <<'EOF'
+Umbralia session launcher — starts umbriel + Noctalia Wayland session.
+
+Usage: umbralia-session [OPTIONS]
+
+Options:
+  -h, --help     Show this help and exit
+  -v, --version  Show version and exit
+  --dry-run      Print actions without executing (for debugging)
+
+Environment:
+  UMBRALIA_NESTED=1   Keep DISPLAY/WAYLAND_DISPLAY (nested test session)
+  XDG_RUNTIME_DIR     Override runtime directory (default: /run/user/$UID)
+
+The launcher:
+  1. Sets XDG session environment variables
+  2. Stops stale graphical-session.target and COSMIC portal
+  3. Starts umbriel compositor
+  4. Finds compositor's Wayland socket
+  5. Exports WAYLAND_DISPLAY and UMBRIEL_PID to systemd/D-Bus
+  6. Restarts xdg-desktop-portal and xdg-desktop-portal-umbriel
+  7. Starts umbralia-session.target (pulls in Noctalia)
+  8. On exit, stops target, portals, and graphical session
+
+Logs: $XDG_RUNTIME_DIR/umbralia-session.log (rotated, keeps 2)
+EOF
+}
+
+case ${1:-} in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    -v|--version)
+        echo "umbralia-session $VERSION"
+        exit 0
+        ;;
+    --dry-run)
+        echo "Would start umbralia session (dry run)"
+        echo "  Compositor: /usr/bin/umbriel"
+        echo "  Shell:      /usr/bin/noctalia"
+        echo "  XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        echo "  UMBRALIA_NESTED: ${UMBRALIA_NESTED:-0}"
+        exit 0
+        ;;
+    --status)
+        if /usr/bin/systemctl --user is-active --quiet umbralia-session.target; then
+            echo "umbralia-session: RUNNING"
+            exit 0
+        else
+            echo "umbralia-session: NOT RUNNING"
+            exit 1
+        fi
+        ;;
+    '')
+        : # no-op, continue
+        ;;
+    *)
+        echo "Unknown option: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+esac
+
+export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_DESKTOP=umbralia
+export DESKTOP_SESSION=umbralia
+# ":wlroots" is what makes xdg-desktop-portal-wlr's .portal file usable. The
+# session also ships umbralia-portals.conf, so the backend is selected
+# explicitly instead of relying on the deprecated UseIn= keys.
+export XDG_CURRENT_DESKTOP=umbralia:wlroots
+# Keep the user's local bin first for the apps Noctalia spawns, but resolve
+# the session binaries below by absolute path so ~/.local/bin cannot shadow
+# the compositor or the shell.
+if [ -n "${PATH:-}" ]; then
+    export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+else
+    export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+fi
+
+# Lets a personal ~/.config/umbriel/autostart skip the services this session
+# already owns:
+#   [ -n "${UMBRALIA_SESSION:-}" ] && exit 0
+export UMBRALIA_SESSION=1
+
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+if [ ! -d "$XDG_RUNTIME_DIR" ]; then
+    echo "umbralia: XDG_RUNTIME_DIR ($XDG_RUNTIME_DIR) does not exist" >&2
+    echo "umbralia: start this session from a logind login, not from a bare console" >&2
+    exit 1
+fi
+export XDG_RUNTIME_DIR
+
+log="$XDG_RUNTIME_DIR/umbralia-session.log"
+# Keep last 2 logs (rotate on start)
+if [ -f "$log" ]; then
+    mv -f "$log" "$log.old" 2>/dev/null || true
+fi
+if ! : >"$log" 2>/dev/null; then
+    log=/dev/null
+fi
+
+say() { printf 'umbralia: %s\n' "$*" >>"$log"; }
+
+# Ensure user config exists; copy Umbralia default if not present
+config_dir="$HOME/.config/umbriel"
+config_file="$config_dir/config.toml"
+default_config="/usr/share/umbralia-session/umbralia-config.toml"
+if [ ! -f "$config_file" ]; then
+    mkdir -p "$config_dir"
+    if [ -f "$default_config" ]; then
+        cp -n "$default_config" "$config_file"
+        say "copied default config from $default_config to $config_file"
+    else
+        say "warning: default config $default_config not found"
+    fi
+fi
+
+comp=/usr/bin/umbriel
+noctalia=/usr/bin/noctalia
+for bin in "$comp" "$noctalia"; do
+    if [ ! -x "$bin" ]; then
+        say "error: $bin is missing or not executable"
+        echo "umbralia: $bin is missing or not executable, see $log" >&2
+        exit 1
+    fi
+done
+
+# umbriel reads ~/.config/umbriel/environment itself and overrides variables set
+# here. A stale XDG_CURRENT_DESKTOP there makes umbriel's children (and Noctalia
+# if it is ever launched by umbriel) see a different desktop name than the
+# systemd user manager, which breaks portal backend selection.
+envfile="$HOME/.config/umbriel/environment"
+if [ -f "$envfile" ]; then
+    env_desktop=$(/usr/bin/grep -E '^[[:space:]]*(export[[:space:]]+)?XDG_CURRENT_DESKTOP[[:space:]]*=' "$envfile" 2>/dev/null |
+        /usr/bin/tail -n 1 | /usr/bin/sed 's/^[^=]*=//' | /usr/bin/tr -d '"' | /usr/bin/tr -d "'")
+    if [ -n "$env_desktop" ] && [ "$env_desktop" != "$XDG_CURRENT_DESKTOP" ]; then
+        say "warning: $envfile sets XDG_CURRENT_DESKTOP=$env_desktop"
+        say "warning: umbriel will use that value; remove the line or set it to $XDG_CURRENT_DESKTOP"
+    fi
+fi
+
+# The package does not install an autostart file. A personal one may still
+# start the same daemons twice (Noctalia, portals).
+# A file that guards those lines with UMBRALIA_SESSION (the documented
+# migration) is fine; only warn when the guard is missing.
+autostart="$HOME/.config/umbriel/autostart"
+if [ -f "$autostart" ] &&
+    ! /usr/bin/grep -v '^[[:space:]]*#' "$autostart" 2>/dev/null |
+        /usr/bin/grep -q 'UMBRALIA_SESSION' &&
+    /usr/bin/grep -v '^[[:space:]]*#' "$autostart" 2>/dev/null |
+        /usr/bin/grep -Eq 'noctalia|xdg-desktop-portal|umbriel-session\.target'; then
+    say "warning: $autostart starts services this session already manages"
+    say "warning: remove those lines or guard them with UMBRALIA_SESSION"
+fi
+
+# umbriel picks its backend from the environment: a set DISPLAY or
+# WAYLAND_DISPLAY means "nested". Leave either set and it tries to open a
+# window instead of DRM/KMS. UMBRALIA_NESTED=1 is for a nested test session
+# with its own user manager (the launcher still stops graphical-session.target,
+# so do not run it from a terminal inside an existing desktop).
+if [ -z "${UMBRALIA_NESTED:-}" ]; then
+    unset WAYLAND_DISPLAY DISPLAY
+fi
+
+# A previous session may have exited without stopping graphical-session.target
+# (a compositor killed by logind, for example). umbralia-session.target is
+# BindsTo= graphical-session.target, so starting ours would reuse the stale
+# target and inherit every PartOf= unit from that session: old portals, and so
+# on. Tear it down before starting the new session.
+if /usr/bin/systemctl --user is-active --quiet graphical-session.target; then
+    say "stopping stale graphical-session.target from a previous session"
+    /usr/bin/systemctl --user stop graphical-session.target >>"$log" 2>&1 || true
+fi
+
+# The COSMIC portal has no PartOf= and can survive a previous session with a
+# stale WAYLAND_DISPLAY. Stop it explicitly; it is not selected by
+# umbralia-portals.conf anyway.
+/usr/bin/systemctl --user stop org.freedesktop.impl.portal.desktop.cosmic.service \
+    >>"$log" 2>&1 || true
+
+stamp="$XDG_RUNTIME_DIR/.umbralia-session-start"
+: >"$stamp"
+
+"$comp" >>"$log" 2>&1 &
+comp_pid=$!
+
+# umbriel exports UMBRIEL_PID for its own children; publish the same value to the
+# systemd user manager and D-Bus so Noctalia (a systemd service, not a umbriel
+# child) can find the compositor. Noctalia uses it for logout and for
+# compositor detection; umbriel --reconfigure needs it too.
+UMBRIEL_PID=$comp_pid
+export UMBRIEL_PID
+
+# On logout the session scope SIGTERMs this script, and even a plain
+# "kill <script>" should not leave the shell and the portals behind.
+cleanup() {
+    # Stopping umbralia-session.target stops Noctalia: it is PartOf= the
+    # target and has a short TimeoutStopSec. Blocking (with a timeout) gives
+    # it a chance to exit before logind tears down the scope.
+    /usr/bin/timeout 10 /usr/bin/systemctl --user stop umbralia-session.target \
+        >>"$log" 2>&1 || true
+    # xdg-desktop-portal-umbriel is PartOf=graphical-session.target and has
+    # ConditionEnvironment=WAYLAND_DISPLAY; stop it before the target so it
+    # does not linger with a stale socket.
+    /usr/bin/timeout 5 /usr/bin/systemctl --user stop xdg-desktop-portal-umbriel.service \
+        >>"$log" 2>&1 || true
+    # The COSMIC backend has no PartOf=; stop it explicitly.
+    /usr/bin/timeout 5 /usr/bin/systemctl --user stop \
+        org.freedesktop.impl.portal.desktop.cosmic.service >>"$log" 2>&1 || true
+    /usr/bin/timeout 10 /usr/bin/systemctl --user stop graphical-session.target \
+        >>"$log" 2>&1 || true
+}
+trap 'cleanup; [ -n "${comp_pid:-}" ] && kill "$comp_pid" 2>/dev/null; exit 143' TERM INT HUP
+
+# Find the socket umbriel listens on (it picks wayland-N itself): Noctalia and
+# everything it spawns has to be pointed at that one.
+sock=""
+i=0
+while [ "$i" -lt 300 ] && kill -0 "$comp_pid" 2>/dev/null; do
+    if [ -x /usr/bin/ss ]; then
+        sock=$(/usr/bin/ss -xlHp 2>/dev/null |
+            /usr/bin/awk -v p="pid=$comp_pid," 'index($0, p) && $2 == "LISTEN" {print $5; exit}')
+    else
+        # no iproute2: newest umbriel socket created since the compositor started.
+        # umbriel names it umbriel-wayland-<N>.sock (not the wayland-<N> used by
+        # other compositors).
+        sock=$(/usr/bin/find "$XDG_RUNTIME_DIR" -maxdepth 1 -name 'umbriel-wayland-*.sock' -type s \
+            -newer "$stamp" -print -quit 2>/dev/null)
+    fi
+    if [ -n "$sock" ] && [ -S "$sock" ]; then
+        break
+    fi
+    sock=""
+    i=$((i + 1))
+    sleep 0.1
+done
+rm -f "$stamp"
+
+if [ -n "$sock" ]; then
+    export WAYLAND_DISPLAY="${sock##*/}"
+
+    # umbriel was started without a display in its environment, so publish ours
+    # for portals and other D-Bus/systemd-activated services. UMBRIEL_PID is
+    # what Noctalia looks for.
+    # Only update D-Bus activation env if dbus is running (avoids error spam)
+    if /usr/bin/systemctl --user is-active --quiet dbus.socket 2>/dev/null; then
+        /usr/bin/dbus-update-activation-environment --systemd \
+            WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE \
+            DESKTOP_SESSION XDG_RUNTIME_DIR PATH UMBRIEL_PID UMBRALIA_SESSION 2>/dev/null || true
+    fi
+    /usr/bin/systemctl --user import-environment \
+        WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE \
+        DESKTOP_SESSION XDG_RUNTIME_DIR PATH UMBRIEL_PID UMBRALIA_SESSION 2>/dev/null || true
+
+    # The package installs the session units. Reload in case the user manager
+    # survived a package upgrade and still has the old unit set cached.
+    /usr/bin/systemctl --user daemon-reload 2>/dev/null || true
+
+    # Both portals are D-Bus activated and may still be running with the
+    # previous session's WAYLAND_DISPLAY. Restarting them costs ~100 ms and
+    # avoids a stale socket. `restart`, not `try-restart`: when the previous
+    # compositor died the backend usually exited too, and try-restart ignores
+    # failed units — that left the portal without a backend for the session.
+    #
+    # xdg-desktop-portal-umbriel has ConditionEnvironment=WAYLAND_DISPLAY, so the
+    # environment import above must happen first.
+    for svc in xdg-desktop-portal.service xdg-desktop-portal-umbriel.service; do
+        /usr/bin/systemctl --user --no-block restart "$svc" >>"$log" 2>&1 || true
+    done
+
+    # umbralia-session.target pulls in umbralia-noctalia.service. systemd
+    # supervises it from here on: restart on crash, journal logging, and
+    # PartOf= for logout.
+    if ! /usr/bin/systemctl --user start umbralia-session.target >>"$log" 2>&1; then
+        say "warning: failed to start umbralia-session.target, see journalctl --user"
+    fi
+else
+    say "compositor socket not found, not starting Noctalia"
+fi
+
+wait "$comp_pid"
+status=$?
+say "compositor exited with status $status"
+
+cleanup
+exit "$status"

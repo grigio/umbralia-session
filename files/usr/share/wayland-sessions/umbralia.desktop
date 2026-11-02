@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Umbralia
+Comment=Minimal umbriel desktop with Noctalia
+Comment[it]=Desktop minimale umbriel con Noctalia
+Exec=/usr/bin/umbralia-session
+TryExec=/usr/bin/umbralia-session
+Type=Application
+X-DesktopNames=umbralia;wlroots
+Keywords=umbralia;umbriel;noctalia;wayland;

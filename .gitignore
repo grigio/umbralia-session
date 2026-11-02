@@ -1,0 +1,14 @@
+# makepkg
+*.pkg.tar.zst
+*.pkg.tar.zst.sha256
+pkg/
+src/
+
+# editors and OS files
+*.swp
+*.swo
+.DS_Store
+
+# Python bytecode
+__pycache__/
+*.pyc

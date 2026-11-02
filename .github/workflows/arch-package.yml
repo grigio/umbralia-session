@@ -1,0 +1,184 @@
+name: Arch package
+
+# Builds the umbralia-session Arch package and attaches it to a GitHub
+# release, for every release tag (v*).
+#
+# Triggers
+#   push of a v* tag   build and publish that tag
+#   workflow_dispatch  rebuild an existing tag (e.g. after fixing the packaging)
+#
+# The package itself is version-less: pkgver comes from the tag (v1.2.2 ->
+# 1.2.2) and pkgrel from the number of commits that touched the packaging, so
+# a rebuild of the same tag is still seen by pacman as an upgrade.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build, e.g. v1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arch-package-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install lint tools
+        run: |
+          pacman -Syu --noconfirm --needed --disable-download-timeout \
+            shellcheck desktop-file-utils taplo-cli jq
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Run shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck files/usr/bin/umbralia-session
+          shellcheck scripts/set-default-greetd.sh
+          shellcheck scripts/install.sh
+
+      - name: Validate desktop file
+        run: desktop-file-validate files/usr/share/wayland-sessions/umbralia.desktop
+
+      - name: Validate portal config
+        run: taplo lint files/usr/share/xdg-desktop-portal/umbralia-portals.conf
+
+  package:
+    name: ${{ github.event.inputs.tag || github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: archlinux:base-devel
+      options: --privileged
+    needs: lint
+    steps:
+      # git has to exist before checkout, otherwise actions/checkout falls back
+      # to downloading a tarball and there is no history for the pkgrel count.
+      - name: Bootstrap git and gh
+        run: pacman -Syu --noconfirm --needed --disable-download-timeout git github-cli
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Build package
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          version=${TAG#v}
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "tag $TAG is not v<major>.<minor>.<patch>" >&2
+            exit 1
+          }
+
+          # pkgrel monotonic with packaging changes only (exclude docs): 1, 2, 3, ...
+          _packaging_files="PKGBUILD umbralia-session.install files scripts/set-default-greetd.sh scripts/install.sh"
+          pkgrel=$(git rev-list --count HEAD -- $_packaging_files)
+          (( pkgrel >= 1 )) || pkgrel=1
+          echo "building umbralia-session $version-$pkgrel"
+
+          useradd -m builder 2>/dev/null || true
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+          mkdir -p /tmp/pkgout
+          chown -R builder:builder "$GITHUB_WORKSPACE" /tmp/pkgout
+
+          # --nodeps: umbriel, noctalia and the portal implementations are not in
+          # the official base-devel container; skipping the check keeps the
+          # build focused on the packaging.
+          su builder -s /bin/bash -c "
+            cd '$GITHUB_WORKSPACE'
+            SESSION_VERSION='$version' SESSION_PKGREL='$pkgrel' \
+            PKGDEST=/tmp/pkgout \
+            makepkg --nodeps --noconfirm --force
+          "
+
+      - name: Collect packages
+        id: pkg
+        run: |
+          set -euo pipefail
+          cd /tmp/pkgout
+          shopt -s nullglob
+          assets=()
+          for file in *.pkg.tar.zst; do
+            sha256sum "$file" > "$file.sha256"
+            assets+=("$file" "$file.sha256")
+          done
+          (( ${#assets[@]} )) || { echo "no package was produced" >&2; exit 1; }
+          printf '%s\n' "${assets[@]}" > /tmp/assets.txt
+          cat /tmp/assets.txt
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd /tmp/pkgout
+          mapfile -t assets < /tmp/assets.txt
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists, uploading assets"
+            gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            notes=$(cat <<EOF
+          Arch Linux package of [Umbralia](https://github.com/$GITHUB_REPOSITORY)
+          \`$TAG\`: the minimal umbriel + Noctalia XDG session (launcher, session
+          entry, systemd user units, portal configuration).
+
+          ### Install
+
+          \`\`\`sh
+          gh release download $TAG -R $GITHUB_REPOSITORY -p '*.pkg.tar.zst*' -D /tmp/umbralia-session
+          cd /tmp/umbralia-session && sha256sum -c ./*.pkg.tar.zst.sha256
+          sudo pacman -U ./*.pkg.tar.zst
+          \`\`\`
+
+          The package does not change the greeter default. To make it selectable
+          in a gtkgreet dropdown without changing the default:
+
+          \`\`\`sh
+          sudo umbralia-session-default --list
+          \`\`\`
+
+          Then, optionally, make it the greeter default:
+
+          \`\`\`sh
+          sudo umbralia-session-default
+          \`\`\`
+
+          Needs \`umbriel\`, \`noctalia\`, \`xdg-desktop-portal-umbriel\`,
+          \`polkit\`, \`gnome-keyring\` and \`wireplumber\`. It can
+          be installed alongside \`cosmalia-session\`.
+
+          ### Revert
+
+          \`\`\`sh
+          sudo pacman -R umbralia-session
+          \`\`\`
+          EOF
+            )
+            gh release create "$TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes "$notes" \
+              --verify-tag
+          fi

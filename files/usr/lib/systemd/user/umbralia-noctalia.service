@@ -1,0 +1,17 @@
+[Unit]
+Description=Noctalia shell (Umbralia)
+Documentation=https://github.com/grigio/umbralia-session
+PartOf=umbralia-session.target
+After=umbralia-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/noctalia
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=5
+Slice=session.slice
+
+# Started by umbralia-session.target (Wants=), not enabled by the user.
